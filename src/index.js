@@ -43,7 +43,11 @@ export default {
   async email(message, env, ctx) {
     const to = String(message.to || "").toLowerCase();
     const from = String(message.from || "");
-    const subject = message.headers.get("subject") || "";
+
+    const subject = decodeMimeSubject(
+      getHeader(message.headers, "subject")
+    );
+
     const raw = await new Response(message.raw).text();
 
     const now = Date.now();
@@ -267,6 +271,45 @@ function randomString(length) {
   }
 
   return out;
+}
+
+function getHeader(headers, name) {
+  return (
+    headers.get(name) ||
+    headers.get(name.toLowerCase()) ||
+    headers.get(name.toUpperCase()) ||
+    ""
+  );
+}
+
+function decodeMimeSubject(subject) {
+  if (!subject) return "";
+
+  let decoded = subject;
+
+  decoded = decoded.replace(/=\?UTF-8\?B\?(.+?)\?=/gi, (_, encoded) => {
+    try {
+      const binary = atob(encoded);
+      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      return "";
+    }
+  });
+
+  decoded = decoded.replace(/=\?UTF-8\?Q\?(.+?)\?=/gi, (_, encoded) => {
+    try {
+      return encoded
+        .replace(/_/g, " ")
+        .replace(/=([A-Fa-f0-9]{2})/g, (_, hex) =>
+          String.fromCharCode(parseInt(hex, 16))
+        );
+    } catch {
+      return "";
+    }
+  });
+
+  return decoded.trim();
 }
 
 function json(data, status = 200) {
