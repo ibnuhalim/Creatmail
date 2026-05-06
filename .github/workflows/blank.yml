@@ -49,20 +49,33 @@ jobs:
         run: |
           set -e
 
+          echo "Checking D1 database: $DB_NAME"
+
           DB_ID=$(npx wrangler d1 list --json | node -e "
           let data = '';
           process.stdin.on('data', c => data += c);
           process.stdin.on('end', () => {
             const list = JSON.parse(data || '[]');
             const db = list.find(x => x.name === process.env.DB_NAME);
-            if (db) console.log(db.uuid || db.id || '');
+            if (db) console.log(db.uuid || db.id || db.database_id || '');
           });
           ")
 
           if [ -z "$DB_ID" ]; then
+            echo "Database not found. Creating..."
             CREATE_OUTPUT=$(npx wrangler d1 create "$DB_NAME")
             echo "$CREATE_OUTPUT"
-            DB_ID=$(echo "$CREATE_OUTPUT" | grep -oE 'database_id = "[^"]+"' | head -n1 | cut -d'"' -f2)
+
+            DB_ID=$(echo "$CREATE_OUTPUT" | node -e "
+            let data = '';
+            process.stdin.on('data', c => data += c);
+            process.stdin.on('end', () => {
+              const match = data.match(/\\\"database_id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"/);
+              if (match) console.log(match[1]);
+            });
+            ")
+          else
+            echo "Database found: $DB_ID"
           fi
 
           if [ -z "$DB_ID" ]; then
@@ -70,6 +83,7 @@ jobs:
             exit 1
           fi
 
+          echo "Database ID: $DB_ID"
           echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
 
       - name: Generate wrangler.toml
