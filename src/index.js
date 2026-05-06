@@ -1,18 +1,15 @@
-import { SignJWT, jwtVerify } from "jose";
-
 export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
 
-      if (request.method === "OPTIONS") {
-        return cors();
-      }
+      if (request.method === "OPTIONS") return cors();
 
       if (url.pathname === "/domains") {
         return json({
           success: true,
-          domains: getAllowedDomains(env)
+          domains: getAllowedDomains(env),
+          default_domain: getDefaultDomain(env)
         });
       }
 
@@ -51,22 +48,34 @@ export default {
     } catch (err) {
       return json({
         success: false,
-        error: String(err && err.message ? err.message : err),
-        stack: String(err && err.stack ? err.stack : "")
+        error: String(err?.message || err),
+        stack: String(err?.stack || "")
       }, 500);
     }
   },
 
-  async email(message, env, ctx) {
+  async email(message, env) {
     try {
       const to = String(message.to || "").toLowerCase();
       const from = String(message.from || "");
-
       const domain = to.split("@")[1] || "";
-      const allowedDomains = getAllowedDomains(env);
 
-      if (!allowedDomains.includes(domain)) {
+      if (!getAllowedDomains(env).includes(domain)) {
         message.setReject("Domain not allowed");
+        return;
+      }
+
+      const now = Date.now();
+
+      const mailbox = await env.DB.prepare(`
+        SELECT email FROM mailboxes
+        WHERE email = ?
+        AND expires_at > ?
+        LIMIT 1
+      `).bind(to, now).first();
+
+      if (!mailbox) {
+        message.setReject("Mailbox not found or expired");
         return;
       }
 
@@ -80,21 +89,6 @@ export default {
       const preview = createPreview(
         parsed.text || stripHtml(parsed.html || "")
       );
-
-      const now = Date.now();
-
-      const mailbox = await env.DB.prepare(`
-        SELECT email
-        FROM mailboxes
-        WHERE email = ?
-        AND expires_at > ?
-        LIMIT 1
-      `).bind(to, now).first();
-
-      if (!mailbox) {
-        message.setReject("Mailbox not found or expired");
-        return;
-      }
 
       const expiresAt =
         now + Number(env.MESSAGE_TTL_MINUTES || 60) * 60 * 1000;
@@ -121,7 +115,7 @@ export default {
         now,
         expiresAt
       ).run();
-    } catch (err) {
+    } catch {
       message.setReject("Worker email error");
     }
   },
@@ -142,7 +136,6 @@ async function createMail(env) {
   }
 
   const domain = getDefaultDomain(env);
-
   const username = randomString(10);
   const password = randomString(16);
   const email = `${username}@${domain}`.toLowerCase();
@@ -349,22 +342,35 @@ async function cleanupExpired(env) {
   `).bind(now).run();
 }
 
-async function generateJWT(env, payload) {
-  const secret = new TextEncoder().encode(env.JWT_SECRET);
+/* =========================
+   JWT MANUAL HS256
+   Tanpa dependency jose
+========================= */
 
-  return await new SignJWT(payload)
-    .setProtectedHeader({
-      alg: "HS256",
-      typ: "JWT"
-    })
-    .setIssuer("XDTOOLS")
-    .setAudience("TMPMAIL")
-    .setIssuedAt()
-    .setExpirationTime(
-      Math.floor(Date.now() / 1000) + Number(env.JWT_EXPIRES || 86400)
-    )
-    .setJti(crypto.randomUUID())
-    .sign(secret);
+async function generateJWT(env, payload) {
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + Number(env.JWT_EXPIRES || 86400);
+
+  const header = {
+    alg: "HS256",
+    typ: "JWT"
+  };
+
+  const body = {
+    ...payload,
+    iss: "XDTOOLS",
+    aud: "TMPMAIL",
+    iat: now,
+    exp,
+    jti: crypto.randomUUID()
+  };
+
+  const h = base64UrlEncode(JSON.stringify(header));
+  const p = base64UrlEncode(JSON.stringify(body));
+  const data = `${h}.${p}`;
+  const sig = await hmacSign(env.JWT_SECRET, data);
+
+  return `${data}.${sig}`;
 }
 
 async function authJWT(request, env) {
@@ -379,13 +385,41 @@ async function authJWT(request, env) {
 
   try {
     const token = auth.slice(7).trim();
+    const parts = token.split(".");
 
-    const secret = new TextEncoder().encode(env.JWT_SECRET);
+    if (parts.length !== 3) {
+      return {
+        ok: false,
+        error: "Invalid token format"
+      };
+    }
 
-    const { payload } = await jwtVerify(token, secret, {
-      issuer: "XDTOOLS",
-      audience: "TMPMAIL"
-    });
+    const [h, p, sig] = parts;
+    const data = `${h}.${p}`;
+    const validSig = await hmacSign(env.JWT_SECRET, data);
+
+    if (sig !== validSig) {
+      return {
+        ok: false,
+        error: "Invalid token signature"
+      };
+    }
+
+    const payload = JSON.parse(base64UrlDecode(p));
+
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      return {
+        ok: false,
+        error: "Token expired"
+      };
+    }
+
+    if (payload.iss !== "XDTOOLS" || payload.aud !== "TMPMAIL") {
+      return {
+        ok: false,
+        error: "Invalid token issuer or audience"
+      };
+    }
 
     if (!payload.email) {
       return {
@@ -398,7 +432,7 @@ async function authJWT(request, env) {
       ok: true,
       payload
     };
-  } catch (err) {
+  } catch {
     return {
       ok: false,
       error: "Invalid token"
@@ -406,13 +440,69 @@ async function authJWT(request, env) {
   }
 }
 
+async function hmacSign(secret, data) {
+  if (!secret) {
+    throw new Error("JWT_SECRET is missing");
+  }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    {
+      name: "HMAC",
+      hash: "SHA-256"
+    },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(data)
+  );
+
+  return base64UrlArrayBuffer(signature);
+}
+
+function base64UrlEncode(input) {
+  return base64UrlArrayBuffer(new TextEncoder().encode(input));
+}
+
+function base64UrlArrayBuffer(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function base64UrlDecode(input) {
+  let value = input.replace(/-/g, "+").replace(/_/g, "/");
+
+  while (value.length % 4) {
+    value += "=";
+  }
+
+  return atob(value);
+}
+
+/* =========================
+   EMAIL PARSER
+========================= */
+
 function parseEmailRaw(raw) {
   const parts = raw.split(/\r?\n\r?\n/);
   const headerText = parts.shift() || "";
   const bodyRaw = parts.join("\n\n");
 
   const headers = parseHeaders(headerText);
-
   const contentType = headers["content-type"] || "";
 
   let text = "";
@@ -426,7 +516,6 @@ function parseEmailRaw(raw) {
 
     for (const section of sections) {
       const sec = section.trim();
-
       if (!sec || sec === "--") continue;
 
       const split = sec.split(/\r?\n\r?\n/);
@@ -543,6 +632,34 @@ function decodeBase64Utf8(input) {
   }
 }
 
+function decodeMimeSubject(subject) {
+  if (!subject) return "";
+
+  let decoded = String(subject);
+
+  decoded = decoded.replace(/=\?UTF-8\?B\?(.+?)\?=/gi, (_, encoded) => {
+    try {
+      return decodeBase64Utf8(encoded);
+    } catch {
+      return "";
+    }
+  });
+
+  decoded = decoded.replace(/=\?UTF-8\?Q\?(.+?)\?=/gi, (_, encoded) => {
+    try {
+      return decodeQuotedPrintableUtf8(encoded.replace(/_/g, " "));
+    } catch {
+      return "";
+    }
+  });
+
+  return decoded.trim();
+}
+
+/* =========================
+   HELPERS
+========================= */
+
 function createPreview(text) {
   return String(text || "")
     .replace(/\s+/g, " ")
@@ -610,32 +727,6 @@ function getHeader(headers, name) {
   );
 }
 
-function decodeMimeSubject(subject) {
-  if (!subject) return "";
-
-  let decoded = String(subject);
-
-  decoded = decoded.replace(/=\?UTF-8\?B\?(.+?)\?=/gi, (_, encoded) => {
-    try {
-      const binary = atob(encoded);
-      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-      return new TextDecoder("utf-8").decode(bytes);
-    } catch {
-      return "";
-    }
-  });
-
-  decoded = decoded.replace(/=\?UTF-8\?Q\?(.+?)\?=/gi, (_, encoded) => {
-    try {
-      return decodeQuotedPrintableUtf8(encoded.replace(/_/g, " "));
-    } catch {
-      return "";
-    }
-  });
-
-  return decoded.trim();
-}
-
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -657,4 +748,4 @@ function cors() {
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS"
     }
   });
-          }
+}
