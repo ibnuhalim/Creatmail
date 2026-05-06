@@ -29,6 +29,7 @@ export default {
     return json({
       success: true,
       name: "TMP Mail API",
+      message_ttl: "1 hour",
       routes: {
         create: "POST /create",
         inbox: "POST /inbox",
@@ -45,12 +46,16 @@ export default {
     const subject = message.headers.get("subject") || "";
     const raw = await new Response(message.raw).text();
 
+    const now = Date.now();
+    const msgTtlMinutes = Number(env.MESSAGE_TTL_MINUTES || 60);
+    const messageExpiresAt = now + msgTtlMinutes * 60 * 1000;
+
     const mailbox = await env.DB.prepare(`
       SELECT email FROM mailboxes
       WHERE email = ?
       AND expires_at > ?
       LIMIT 1
-    `).bind(to, Date.now()).first();
+    `).bind(to, now).first();
 
     if (!mailbox) {
       message.setReject("Mailbox not found or expired");
@@ -59,16 +64,21 @@ export default {
 
     await env.DB.prepare(`
       INSERT INTO emails
-      (mailbox_email, from_addr, to_addr, subject, raw, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      (mailbox_email, from_addr, to_addr, subject, raw, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `).bind(
       to,
       from,
       to,
       subject,
       raw,
-      Date.now()
+      now,
+      messageExpiresAt
     ).run();
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cleanupExpired(env));
   }
 };
 
@@ -78,7 +88,7 @@ async function createMail(env) {
   const email = `${username}@${env.DOMAIN}`.toLowerCase();
 
   const now = Date.now();
-  const ttlHours = Number(env.TTL_HOURS || 24);
+  const ttlHours = Number(env.MAILBOX_TTL_HOURS || 24);
   const expiresAt = now + ttlHours * 60 * 60 * 1000;
 
   await env.DB.prepare(`
@@ -91,7 +101,9 @@ async function createMail(env) {
     success: true,
     email,
     password,
-    expires_at: expiresAt
+    expires_at: expiresAt,
+    inbox_api: "/inbox",
+    message_api: "/message"
   });
 }
 
@@ -105,13 +117,16 @@ async function getInbox(request, env) {
 
   const email = body.email.toLowerCase();
 
+  await cleanupExpired(env);
+
   const data = await env.DB.prepare(`
-    SELECT id, from_addr, to_addr, subject, created_at
+    SELECT id, from_addr, to_addr, subject, created_at, expires_at
     FROM emails
     WHERE mailbox_email = ?
+    AND expires_at > ?
     ORDER BY created_at DESC
     LIMIT 50
-  `).bind(email).all();
+  `).bind(email, Date.now()).all();
 
   return json({
     success: true,
@@ -131,16 +146,19 @@ async function getMessage(request, env) {
   const email = body.email.toLowerCase();
   const id = Number(body.id || 0);
 
+  await cleanupExpired(env);
+
   const msg = await env.DB.prepare(`
     SELECT *
     FROM emails
     WHERE id = ?
     AND mailbox_email = ?
+    AND expires_at > ?
     LIMIT 1
-  `).bind(id, email).first();
+  `).bind(id, email, Date.now()).first();
 
   if (!msg) {
-    return json({ success: false, error: "Message not found" }, 404);
+    return json({ success: false, error: "Message not found or expired" }, 404);
   }
 
   return json({
@@ -159,13 +177,13 @@ async function deleteMailbox(request, env) {
 
   const email = body.email.toLowerCase();
 
-  await env.DB.prepare(`DELETE FROM emails WHERE mailbox_email = ?`)
-    .bind(email)
-    .run();
+  await env.DB.prepare(`
+    DELETE FROM emails WHERE mailbox_email = ?
+  `).bind(email).run();
 
-  await env.DB.prepare(`DELETE FROM mailboxes WHERE email = ?`)
-    .bind(email)
-    .run();
+  await env.DB.prepare(`
+    DELETE FROM mailboxes WHERE email = ?
+  `).bind(email).run();
 
   return json({
     success: true,
@@ -174,7 +192,21 @@ async function deleteMailbox(request, env) {
 }
 
 async function cleanup(env) {
+  await cleanupExpired(env);
+
+  return json({
+    success: true,
+    message: "Expired emails and mailboxes cleaned"
+  });
+}
+
+async function cleanupExpired(env) {
   const now = Date.now();
+
+  await env.DB.prepare(`
+    DELETE FROM emails
+    WHERE expires_at <= ?
+  `).bind(now).run();
 
   await env.DB.prepare(`
     DELETE FROM emails
@@ -184,13 +216,9 @@ async function cleanup(env) {
   `).bind(now).run();
 
   await env.DB.prepare(`
-    DELETE FROM mailboxes WHERE expires_at <= ?
+    DELETE FROM mailboxes
+    WHERE expires_at <= ?
   `).bind(now).run();
-
-  return json({
-    success: true,
-    message: "Expired mailboxes cleaned"
-  });
 }
 
 async function checkAuth(env, email, password) {
