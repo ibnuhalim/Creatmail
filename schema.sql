@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS emails (
   to_addr TEXT,
   subject TEXT,
   raw TEXT,
+  preview TEXT,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
