@@ -1,4 +1,4 @@
-name: Deploy Cloudflare TMP Mail Worker
+name: Deploy TMP Mail Worker
 
 on:
   workflow_dispatch:
@@ -6,18 +6,18 @@ on:
       cf_token:
         description: "Cloudflare API Token"
         required: true
+
       cf_account_id:
         description: "Cloudflare Account ID"
         required: true
-      domain:
-        description: "Domain email, contoh: domainkamu.com"
-        required: true
+
       worker_name:
-        description: "Worker name"
+        description: "Worker Name"
         required: true
         default: "tmp-mail-api"
+
       db_name:
-        description: "D1 database name"
+        description: "D1 Database Name"
         required: true
         default: "tmp_mail"
 
@@ -28,7 +28,6 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ github.event.inputs.cf_token }}
       CLOUDFLARE_ACCOUNT_ID: ${{ github.event.inputs.cf_account_id }}
-      DOMAIN: ${{ github.event.inputs.domain }}
       WORKER_NAME: ${{ github.event.inputs.worker_name }}
       DB_NAME: ${{ github.event.inputs.db_name }}
 
@@ -36,54 +35,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup NodeJS
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install dependencies
+      - name: Install deps
         run: npm install
 
-      - name: Create or get D1 database
+      - name: Read domains.txt
+        id: domains
+        run: |
+          DOMAINS=$(grep -v '^#' domains.txt | grep -v '^$' | paste -sd "," -)
+
+          DEFAULT_DOMAIN=$(head -n 1 domains.txt)
+
+          echo "domains=$DOMAINS" >> "$GITHUB_OUTPUT"
+          echo "default_domain=$DEFAULT_DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Generate JWT secret
+        id: jwt
+        run: |
+          JWT_SECRET=$(openssl rand -hex 64)
+
+          echo "jwt_secret=$JWT_SECRET" >> "$GITHUB_OUTPUT"
+
+      - name: Create/Get D1
         id: d1
         run: |
-          set -e
-
-          echo "Checking D1 database: $DB_NAME"
-
           DB_ID=$(npx wrangler d1 list --json | node -e "
-          let data = '';
-          process.stdin.on('data', c => data += c);
-          process.stdin.on('end', () => {
-            const list = JSON.parse(data || '[]');
-            const db = list.find(x => x.name === process.env.DB_NAME);
-            if (db) console.log(db.uuid || db.id || db.database_id || '');
+          let data='';
+          process.stdin.on('data',c=>data+=c);
+          process.stdin.on('end',()=>{
+            const list=JSON.parse(data||'[]');
+            const db=list.find(x=>x.name===process.env.DB_NAME);
+            if(db) console.log(db.uuid||db.id||db.database_id||'');
           });
           ")
 
           if [ -z "$DB_ID" ]; then
-            echo "Database not found. Creating..."
             CREATE_OUTPUT=$(npx wrangler d1 create "$DB_NAME")
-            echo "$CREATE_OUTPUT"
 
             DB_ID=$(echo "$CREATE_OUTPUT" | node -e "
-            let data = '';
-            process.stdin.on('data', c => data += c);
-            process.stdin.on('end', () => {
-              const match = data.match(/\\\"database_id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"/);
-              if (match) console.log(match[1]);
+            let data='';
+            process.stdin.on('data',c=>data+=c);
+            process.stdin.on('end',()=>{
+              const match=data.match(/\\\"database_id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"/);
+              if(match) console.log(match[1]);
             });
             ")
-          else
-            echo "Database found: $DB_ID"
           fi
 
-          if [ -z "$DB_ID" ]; then
-            echo "Failed to get database_id"
-            exit 1
-          fi
-
-          echo "Database ID: $DB_ID"
           echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
 
       - name: Generate wrangler.toml
@@ -94,7 +96,10 @@ jobs:
           compatibility_date = "2026-05-06"
 
           [vars]
-          DOMAIN = "$DOMAIN"
+          DOMAINS = "${{ steps.domains.outputs.domains }}"
+          DEFAULT_DOMAIN = "${{ steps.domains.outputs.default_domain }}"
+          JWT_SECRET = "${{ steps.jwt.outputs.jwt_secret }}"
+          JWT_EXPIRES = "86400"
           MAILBOX_TTL_HOURS = "24"
           MESSAGE_TTL_MINUTES = "60"
 
@@ -107,10 +112,12 @@ jobs:
           database_id = "${{ steps.d1.outputs.database_id }}"
           EOF
 
-          cat wrangler.toml
-
       - name: Init D1 schema
-        run: npx wrangler d1 execute "$DB_NAME" --remote --file=schema.sql
+        run: |
+          npx wrangler d1 execute "$DB_NAME" \
+          --remote \
+          --file=schema.sql
 
       - name: Deploy Worker
-        run: npx wrangler deploy
+        run: |
+          npx wrangler deploy
