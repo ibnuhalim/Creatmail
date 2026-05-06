@@ -2,9 +2,8 @@
   "name": "tmp-mail-api",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+  "dependencies": {
+    "jose": "^5.2.4"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
